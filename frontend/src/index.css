@@ -1,0 +1,38 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #1a1625;
+  color: #ffffff;
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: 14px;
+}
+
+.react-flow__background {
+  background: #1a1625;
+}
+
+.react-flow__controls button {
+  background: #2d2545;
+  border-color: #3d3360;
+  color: #a89cc8;
+}
+
+.react-flow__controls button:hover {
+  background: #392F5A;
+}
+
+.react-flow__minimap {
+  background: #231d33;
+}
+
+.react-flow__node.selected > div {
+  outline: 2px solid #9DD9D2;
+  outline-offset: 2px;
+}
