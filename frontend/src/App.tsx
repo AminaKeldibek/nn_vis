@@ -19,7 +19,7 @@ import { TextNode, type TextNodeData } from './nodes/TextNode'
 import { TensorNode, type TensorNodeData } from './nodes/TensorNode'
 import { LinearNode, type LinearNodeData } from './nodes/LinearNode'
 import { SoftmaxNode, type SoftmaxNodeData } from './nodes/SoftmaxNode'
-import { GroupNode, type GroupNodeData, type EdgeSnapshot, type SavedEdge } from './nodes/GroupNode'
+import { GroupNode, type GroupNodeData, type EdgeSnapshot, type SavedEdge, type ReflowSnapshot } from './nodes/GroupNode'
 import { SiluNode } from './nodes/SiluNode'
 import { SigmoidNode } from './nodes/SigmoidNode'
 import { TopkNode, type TopkNodeData } from './nodes/TopkNode'
@@ -179,7 +179,8 @@ function getGroupExitModules(gd: GroupNodeData): string[] {
   return [...allIds].filter(id => !fromSet.has(id))
 }
 
-// Recursively flatten a group's moduleChain to actual backend module IDs
+// Recursively flatten a group's moduleChain to actual backend module IDs (ENTRY modules only).
+// Used for resolving edge endpoints when a connection lands on a group node.
 function getFlatModuleIds(moduleChain: string[], allNodes: Node[]): string[] {
   const result: string[] = []
   for (const id of moduleChain) {
@@ -191,6 +192,150 @@ function getFlatModuleIds(moduleChain: string[], allNodes: Node[]): string[] {
       result.push(id)
     }
   }
+  return result
+}
+
+// Visual footprint (width/height) of a node in its parent's coordinate space.
+// Collapsed group → pill; expanded group → its style w/h; module → measured.
+function getNodeFootprint(n: Node): { w: number; h: number } {
+  if (n.type === 'blockGroup') {
+    const gd = n.data as GroupNodeData
+    if (gd.collapsed) {
+      return { w: (n.measured as any)?.width ?? COLLAPSED_NODE_W, h: (n.measured as any)?.height ?? COLLAPSED_HEIGHT }
+    }
+    return {
+      w: (n.style?.width as number) ?? gd.expandedWidth ?? 300,
+      h: (n.style?.height as number) ?? gd.expandedHeight ?? 200,
+    }
+  }
+  return {
+    w: (n.measured as any)?.width ?? 180,
+    h: (n.measured as any)?.height ?? 120,
+  }
+}
+
+// After a group's footprint changes (expand/collapse), reflow:
+//   1. Push later same-level siblings down by Δh; right by Δw if vertically overlapping.
+//   2. Grow the immediate parent group's expanded size to fit (collapsed parent untouched).
+//   3. Recurse on the parent (its own footprint just changed).
+// Only down/right shifts — never reflows above the changed node.
+// Returns both the updated nodes and a SNAPSHOT of every change made (sibling shifts + ancestor resizes),
+// so the caller (expand) can store it on the toggled group and the collapse can perfectly undo.
+function reflowAfterFootprintChange(
+  nodes: Node[],
+  changedId: string,
+  prevFootprint: { w: number; h: number },
+  newFootprint: { w: number; h: number },
+  acc?: ReflowSnapshot,
+): { nodes: Node[]; snapshot: ReflowSnapshot } {
+  const snapshot: ReflowSnapshot = acc ?? { shifts: [], resizes: [] }
+  const dw = newFootprint.w - prevFootprint.w
+  const dh = newFootprint.h - prevFootprint.h
+  if (dw === 0 && dh === 0) return { nodes, snapshot }
+
+  const changedNode = nodes.find(n => n.id === changedId)
+  if (!changedNode) return { nodes, snapshot }
+
+  const parentId = changedNode.parentId
+  // No parent → don't touch canvas-root siblings (independent standalone nodes shouldn't shift
+  // when a top-level group toggles).
+  if (!parentId) return { nodes, snapshot }
+
+  const changedX = changedNode.position.x
+  const changedY = changedNode.position.y
+  const PADDING = 24
+
+  const updated = nodes.map(n => {
+    if (n.id === changedId) return n
+    if (n.parentId !== parentId) return n
+    const nFoot = getNodeFootprint(n)
+    let nx = n.position.x
+    let ny = n.position.y
+
+    if (dh > 0 && ny >= changedY) {
+      ny += dh
+    } else if (dh < 0 && ny + dh >= changedY) {
+      ny += dh
+    }
+    const sibTop = n.position.y
+    const sibBot = sibTop + nFoot.h
+    const verticallyOverlaps = (chgTop: number, chgBot: number) => sibBot > chgTop && sibTop < chgBot
+    if (dw > 0) {
+      if (verticallyOverlaps(changedY, changedY + Math.max(prevFootprint.h, newFootprint.h)) && nx >= changedX + prevFootprint.w) {
+        nx += dw
+      }
+    } else if (dw < 0) {
+      if (verticallyOverlaps(changedY, changedY + prevFootprint.h) && nx + dw >= changedX + newFootprint.w) {
+        nx += dw
+      }
+    }
+
+    if (nx === n.position.x && ny === n.position.y) return n
+    snapshot.shifts.push({ id: n.id, dx: nx - n.position.x, dy: ny - n.position.y })
+    return { ...n, position: { x: nx, y: ny } }
+  })
+
+  const parentNode = updated.find(n => n.id === parentId)
+  if (!parentNode || parentNode.type !== 'blockGroup') return { nodes: updated, snapshot }
+  const parentGd = parentNode.data as GroupNodeData
+  if (parentGd.collapsed) return { nodes: updated, snapshot }
+
+  // Recompute parent bounds from all visible direct children
+  let maxRight = 0, maxBottom = 0
+  for (const n of updated) {
+    if (n.parentId !== parentId) continue
+    if (n.hidden) continue
+    const f = getNodeFootprint(n)
+    maxRight = Math.max(maxRight, n.position.x + f.w)
+    maxBottom = Math.max(maxBottom, n.position.y + f.h)
+  }
+  const requiredW = maxRight + PADDING
+  const requiredH = maxBottom + PADDING
+
+  const parentPrevFoot = getNodeFootprint(parentNode)
+  const newW = Math.max(parentPrevFoot.w, requiredW)
+  const newH = Math.max(parentPrevFoot.h, requiredH)
+
+  if (newW === parentPrevFoot.w && newH === parentPrevFoot.h) return { nodes: updated, snapshot }
+
+  snapshot.resizes.push({ id: parentId, prevW: parentPrevFoot.w, prevH: parentPrevFoot.h })
+
+  // Update only style — keep data.expandedWidth/Height as the immutable "natural" intent
+  let withParentResized = updated.map(n => {
+    if (n.id !== parentId) return n
+    return {
+      ...n,
+      style: { ...(n.style ?? {}), width: newW, height: newH },
+    }
+  })
+
+  return reflowAfterFootprintChange(
+    withParentResized,
+    parentId,
+    parentPrevFoot,
+    { w: newW, h: newH },
+    snapshot,
+  )
+}
+
+// All module ids reachable from a node by walking memberIds recursively (every module at every depth).
+// Used for collecting full module set when snapshotting a parent group containing nested groups.
+function getAllModuleIdsRecursive(rootId: string, allNodes: Node[]): string[] {
+  const result: string[] = []
+  const seen = new Set<string>()
+  const visit = (id: string) => {
+    if (seen.has(id)) return
+    seen.add(id)
+    const node = allNodes.find(n => n.id === id)
+    if (!node) return
+    if (ALL_MODULE_TYPES.has(node.type ?? '')) {
+      result.push(id)
+    } else if (node.type === 'blockGroup') {
+      for (const mid of ((node.data as GroupNodeData).memberIds ?? [])) visit(mid)
+    }
+    // tensors and others ignored
+  }
+  visit(rootId)
   return result
 }
 
@@ -243,11 +388,37 @@ type ModuleSnapshot = {
   relativePosition: { x: number; y: number }
 }
 
+// Visual-hierarchy-only snapshot (used IN ADDITION to the flat moduleChain/internalEdges).
+// When present, the drop path does a re-parenting pass to recreate the nested visual structure.
+// Flat moduleChain/internalEdges (used for wiring) are unchanged in nested mode.
+type NestedMember =
+  | {
+      kind: 'module'
+      tmpId: string
+      relativePosition: { x: number; y: number }   // relative to immediate parent group
+    }
+  | {
+      kind: 'group'
+      tmpId: string                                  // not referenced by moduleChain — purely a hierarchy id
+      label: string
+      relativePosition: { x: number; y: number }   // relative to immediate parent group
+      expandedWidth: number
+      expandedHeight: number
+      members: NestedMember[]
+    }
+
+type NestedGroupSnapshot = {
+  members: NestedMember[]
+  expandedWidth: number
+  expandedHeight: number
+}
+
 type GroupRegistryEntry = {
   id: string
   label: string
   moduleChain: ModuleSnapshot[]
-  internalEdges?: EdgeSnapshot[]  // optional for backward compat with old localStorage entries
+  internalEdges?: EdgeSnapshot[]
+  nestedSnapshot?: NestedGroupSnapshot   // present iff the saved group contained nested blockGroups
 }
 
 export default function App() {
@@ -453,10 +624,8 @@ export default function App() {
 
       const expandedH = gd.expandedHeight ?? 200
       const expandedBottom = group.position.y + expandedH
-      // Visibility map: which transitive members should be visible (respects child group states)
       const visMap = computeExpandVisibility(groupId, allNodes)
 
-      // Footprints before/after for reflow
       const prevFootprint = getNodeFootprint(group)
       const newFootprint = { w: gd.expandedWidth, h: gd.expandedHeight }
 
@@ -484,8 +653,11 @@ export default function App() {
           }
           return n
         })
-        // Propagate the footprint change up the parent chain (only meaningful when this group has a parent)
-        return reflowAfterFootprintChange(stepped, groupId, prevFootprint, newFootprint)
+        const { nodes: reflowed, snapshot } = reflowAfterFootprintChange(stepped, groupId, prevFootprint, newFootprint)
+        // Stash the snapshot of changes on the toggled group so collapse can perfectly undo
+        return reflowed.map(n =>
+          n.id === groupId ? { ...n, data: { ...(n.data as GroupNodeData), reflowSnapshot: snapshot } } : n
+        )
       })
       setEdges(es => es.map((ed: Edge) => {
         const orig = savedMap.get(ed.id)
@@ -538,12 +710,12 @@ export default function App() {
       // Hide all transitive members (including nested group members)
       const allGroupMembers = collectTransitiveMembers(memberSet, allNodes)
 
-      const prevFootprintCol = getNodeFootprint(group)
-      // Approximated collapsed footprint (will be measured precisely later, but this is enough for reflow)
-      const newFootprintCol = { w: COLLAPSED_NODE_W, h: COLLAPSED_HEIGHT }
+      // If there's a snapshot from this group's last expand, apply the inverse to perfectly
+      // restore siblings + ancestor sizes to the pre-expand state.
+      const reflowSnapshot = gd.reflowSnapshot
 
       setNodes(ns => {
-        const stepped = ns.map((n: Node) => {
+        return ns.map((n: Node) => {
           if (n.id === groupId) {
             return {
               ...n,
@@ -557,6 +729,7 @@ export default function App() {
                 expandedX: savedExpandedX,
                 savedBoundaryEdges,
                 positionDelta: delta,
+                reflowSnapshot: undefined,  // consumed
               },
             }
           }
@@ -564,9 +737,23 @@ export default function App() {
           if (delta && downstreamIds.has(n.id)) {
             return { ...n, position: { ...n.position, y: n.position.y - delta } }
           }
+          // Inverse-apply the snapshot: pull back any sibling that was shifted, restore any ancestor's size
+          if (reflowSnapshot) {
+            const shift = reflowSnapshot.shifts.find(s => s.id === n.id)
+            const resize = reflowSnapshot.resizes.find(r => r.id === n.id)
+            if (shift || resize) {
+              let result: Node = n
+              if (shift) {
+                result = { ...result, position: { x: result.position.x - shift.dx, y: result.position.y - shift.dy } }
+              }
+              if (resize) {
+                result = { ...result, style: { ...(result.style ?? {}), width: resize.prevW, height: resize.prevH } }
+              }
+              return result
+            }
+          }
           return n
         })
-        return reflowAfterFootprintChange(stepped, groupId, prevFootprintCol, newFootprintCol)
       })
       setEdges(es => es.map((ed: Edge) => {
         if (incomingIds.has(ed.id)) {
@@ -766,169 +953,172 @@ export default function App() {
         const sourceGroupId = e.dataTransfer.getData('application/nnvis-group-id')
         const template = sourceGroupId ? groupRegistry.find(g => g.id === sourceGroupId) : undefined
 
-        const hasV2 = !!(template?.rootMembers && template.rootMembers.length > 0)
-        const hasV1 = !!(template?.moduleChain && template.moduleChain.length > 0)
+        if (template && template.moduleChain.length > 0) {
+          // Clone: create only modules at their relative positions, start collapsed
+          // Tensors are NOT pre-created — they are generated when the user connects a tensor to the group
+          const res = await api.createGroup(label, [])
+          const gid = res.group.id
 
-        if (template && (hasV2 || hasV1)) {
-          // Adapt v1 (legacy flat) into v2 (recursive) on the fly so we have one code path.
-          const v2Root: { members: MemberSnapshot[]; moduleChain: string[]; internalEdges: EdgeSnapshot[] } =
-            hasV2 ? {
-              members: template.rootMembers!,
-              moduleChain: template.rootModuleChain ?? [],
-              internalEdges: template.rootInternalEdges ?? [],
-            } : {
-              members: (template.moduleChain ?? []).map(m => ({ kind: 'module' as const, ...m })),
-              moduleChain: template.internalEdges !== undefined
-                ? (() => {
-                    const targets = new Set((template.internalEdges ?? []).map(e => e.to))
-                    return (template.moduleChain ?? []).map(m => m.tmpId).filter(id => !targets.has(id))
-                  })()
-                : (template.moduleChain ?? []).filter(m => MODULE_TYPES.has(m.type)).map(m => m.tmpId),
-              internalEdges: template.internalEdges ?? [],
-            }
-
-          // Module backend factory — params and node data builder per type
-          const buildModuleParams = (m: ModuleSnapshot) => {
-            switch (m.type) {
-              case 'linear': return { n_out: (m.data as LinearNodeData).n_out ?? 64 }
-              case 'softmax': return { dim: (m.data as SoftmaxNodeData).dim ?? -1 }
-              case 'topk': return { k: (m.data as TopkNodeData).k ?? 1, dim: (m.data as TopkNodeData).dim ?? -1 }
-              case 'view': return { shape: (m.data as ViewNodeData).shape ?? '' }
-              case 'flatten': return { start_dim: (m.data as FlattenNodeData).start_dim ?? 0, end_dim: (m.data as FlattenNodeData).end_dim ?? -1 }
-              case 'bincount': return { minlength: (m.data as BincountNodeData).minlength ?? 0 }
-              case 'unsqueeze': return { dim: (m.data as UnsqueezeNodeData).dim ?? 0 }
-              case 'where': return { condition: (m.data as WhereNodeData).condition ?? '' }
-              case 'index_add': return { dim: (m.data as IndexAddNodeData).dim ?? 0 }
-              case 'indexing': return { expr: (m.data as IndexingNodeData).expr ?? 'rows, ...' }
-              default: return {}
-            }
+          const PADDING = 24
+          const PADDING_TOP = 44
+          let maxRelX = 0, maxRelY = 0
+          for (const m of template.moduleChain) {
+            maxRelX = Math.max(maxRelX, m.relativePosition.x + 200)
+            maxRelY = Math.max(maxRelY, m.relativePosition.y + 120)
           }
-          const buildNodeData = (m: ModuleSnapshot, returned: any) => {
-            switch (m.type) {
-              case 'linear': return { n_out: returned.n_out ?? 64 }
-              case 'softmax': return { dim: returned.dim ?? -1 }
-              case 'topk': return { k: returned.k ?? 1, dim: returned.dim ?? -1 }
-              case 'view': return { shape: returned.shape ?? '' }
-              case 'flatten': return { start_dim: returned.start_dim ?? 0, end_dim: returned.end_dim ?? -1 }
-              case 'bincount': return { minlength: returned.minlength ?? 0 }
-              case 'unsqueeze': return { dim: returned.dim ?? 0 }
-              case 'where': return { condition: returned.condition ?? '' }
-              case 'index_add': return { dim: returned.dim ?? 0 }
-              case 'indexing': return { expr: returned.expr ?? 'rows, ...' }
-              default: return {}
-            }
+          // For nested templates, the flat moduleChain contains inner modules whose root-relative
+          // positions extend deep below the user's grouped layout — using them yields a too-tall
+          // bounding box. Prefer the nestedSnapshot's saved bounds (the user-visible group rect).
+          const gw = template.nestedSnapshot
+            ? template.nestedSnapshot.expandedWidth
+            : maxRelX + PADDING
+          const gh = template.nestedSnapshot
+            ? template.nestedSnapshot.expandedHeight
+            : maxRelY + PADDING_TOP + PADDING
+
+          const newMemberNodes: Node[] = []
+          const newMemberIds: string[] = []
+          const tmpIdToNewId = new Map<string, string>()
+
+          for (const m of template.moduleChain) {
+            try {
+              let params: Record<string, unknown> = {}
+              if (m.type === 'linear') {
+                params = { n_out: (m.data as LinearNodeData).n_out ?? 64 }
+              } else if (m.type === 'softmax') {
+                params = { dim: (m.data as SoftmaxNodeData).dim ?? -1 }
+              } else if (m.type === 'topk') {
+                params = { k: (m.data as TopkNodeData).k ?? 1, dim: (m.data as TopkNodeData).dim ?? -1 }
+              } else if (m.type === 'view') {
+                params = { shape: (m.data as ViewNodeData).shape ?? '' }
+              } else if (m.type === 'flatten') {
+                params = { start_dim: (m.data as FlattenNodeData).start_dim ?? 0, end_dim: (m.data as FlattenNodeData).end_dim ?? -1 }
+              } else if (m.type === 'bincount') {
+                params = { minlength: (m.data as BincountNodeData).minlength ?? 0 }
+              } else if (m.type === 'unsqueeze') {
+                params = { dim: (m.data as UnsqueezeNodeData).dim ?? 0 }
+              } else if (m.type === 'where') {
+                params = { condition: (m.data as WhereNodeData).condition ?? '' }
+              } else if (m.type === 'index_add') {
+                params = { dim: (m.data as IndexAddNodeData).dim ?? 0 }
+              } else if (m.type === 'indexing') {
+                params = { expr: (m.data as IndexingNodeData).expr ?? 'rows, ...' }
+              }
+              // mul, silu, sigmoid: no params needed
+              const mr = await api.createModule(m.type, params)
+              tmpIdToNewId.set(m.tmpId, mr.module.id)
+              newMemberIds.push(mr.module.id)
+              // Rebuild node data from response params
+              let nodeData: Record<string, unknown> = {}
+              if (m.type === 'linear') nodeData = { n_out: mr.module.params.n_out ?? 64 }
+              else if (m.type === 'softmax') nodeData = { dim: mr.module.params.dim ?? -1 }
+              else if (m.type === 'topk') nodeData = { k: mr.module.params.k ?? 1, dim: mr.module.params.dim ?? -1 }
+              else if (m.type === 'view') nodeData = { shape: mr.module.params.shape ?? '' }
+              else if (m.type === 'flatten') nodeData = { start_dim: mr.module.params.start_dim ?? 0, end_dim: mr.module.params.end_dim ?? -1 }
+              else if (m.type === 'bincount') nodeData = { minlength: mr.module.params.minlength ?? 0 }
+              else if (m.type === 'unsqueeze') nodeData = { dim: mr.module.params.dim ?? 0 }
+              else if (m.type === 'where') nodeData = { condition: mr.module.params.condition ?? '' }
+              else if (m.type === 'index_add') nodeData = { dim: mr.module.params.dim ?? 0 }
+              else if (m.type === 'indexing') nodeData = { expr: mr.module.params.expr ?? 'rows, ...' }
+              newMemberNodes.push({
+                id: mr.module.id,
+                type: m.type,
+                position: m.relativePosition,
+                data: nodeData,
+                parentId: gid,
+                extent: 'parent' as const,
+                hidden: true,
+              })
+            } catch { /* skip failed members */ }
           }
 
-          // Recursive clone — creates one backend group per visual group at every depth.
-          // All groups start collapsed; all non-top-level nodes start hidden.
-          const allCreatedNodes: Node[] = []
-          const cloneLevel = async (
-            members: MemberSnapshot[],
-            levelModuleChain: string[],
-            levelInternalEdges: EdgeSnapshot[],
-            parentGid: string,
-            depth: number,
-          ): Promise<{ memberIds: string[]; bounds: { w: number; h: number } }> => {
-            const tmpToNew = new Map<string, string>()
-            const memberIds: string[] = []
-            let maxRelX = 0, maxRelY = 0
+          if (newMemberIds.length > 0) {
+            await api.patchGroup(gid, { member_ids: newMemberIds })
+          }
 
-            for (const member of members) {
-              try {
-                if (member.kind === 'module') {
-                  const mr = await api.createModule(member.type, buildModuleParams(member))
-                  tmpToNew.set(member.tmpId, mr.module.id)
-                  memberIds.push(mr.module.id)
-                  allCreatedNodes.push({
-                    id: mr.module.id,
-                    type: member.type,
-                    position: member.relativePosition,
-                    data: buildNodeData(member, mr.module.params),
-                    parentId: parentGid,
-                    extent: 'parent' as const,
-                    hidden: depth >= 1,  // hidden if not at top level (parent starts collapsed)
-                  })
-                  maxRelX = Math.max(maxRelX, member.relativePosition.x + 200)
-                  maxRelY = Math.max(maxRelY, member.relativePosition.y + 120)
+          // Build topology for new group instance
+          let groupModuleChain: string[]
+          let groupInternalEdges: EdgeSnapshot[] | undefined
+
+          if (template.internalEdges !== undefined) {
+            const newInternalEdges: EdgeSnapshot[] = template.internalEdges.map(e => ({
+              from: tmpIdToNewId.get(e.from) ?? e.from,
+              fromHandle: e.fromHandle,
+              to: tmpIdToNewId.get(e.to) ?? e.to,
+              toHandle: e.toHandle,
+            }))
+            const targetedInNew = new Set(newInternalEdges.map(e => e.to))
+            groupModuleChain = newMemberIds.filter(id => !targetedInNew.has(id))
+            groupInternalEdges = newInternalEdges
+          } else {
+            // Legacy sequential: moduleChain = sequential MODULE_TYPES only, in template order
+            groupModuleChain = template.moduleChain
+              .filter(m => MODULE_TYPES.has(m.type) && tmpIdToNewId.has(m.tmpId))
+              .map(m => tmpIdToNewId.get(m.tmpId)!)
+            groupInternalEdges = undefined
+          }
+
+          // ── Nested re-parenting pass ─────────────────────────────────────
+          // If the template captured a nested visual hierarchy, recreate it now.
+          // Strategy: the flat clone above already created every backend module and parented it to `gid`.
+          // We walk the nested tree, create one backend group per nested visual group, and re-parent
+          // modules into their immediate parent group. Wiring (moduleChain/internalEdges) is unchanged.
+          const nestedGroupNodes: Node[] = []
+          let rootDirectMemberIds: string[] | null = null
+          if (template.nestedSnapshot) {
+            const cloneNestedLevel = async (members: NestedMember[], parentGid: string): Promise<string[]> => {
+              const ids: string[] = []
+              for (const m of members) {
+                if (m.kind === 'module') {
+                  const newId = tmpIdToNewId.get(m.tmpId)
+                  if (!newId) continue
+                  const idx = newMemberNodes.findIndex(n => n.id === newId)
+                  if (idx >= 0) {
+                    newMemberNodes[idx] = {
+                      ...newMemberNodes[idx],
+                      parentId: parentGid,
+                      position: m.relativePosition,
+                    }
+                  }
+                  ids.push(newId)
                 } else {
-                  // Nested group — recurse
-                  const subRes = await api.createGroup(member.label, [])
-                  const subGid = subRes.group.id
-                  tmpToNew.set(member.tmpId, subGid)
-                  memberIds.push(subGid)
-                  const sub = await cloneLevel(
-                    member.members,
-                    member.moduleChain,
-                    member.internalEdges,
-                    subGid,
-                    depth + 1,
-                  )
-                  allCreatedNodes.push({
+                  // Create backend group for this nested visual group
+                  let subGid: string
+                  try {
+                    const subRes = await api.createGroup(m.label, [])
+                    subGid = subRes.group.id
+                  } catch {
+                    continue
+                  }
+                  const subMemberIds = await cloneNestedLevel(m.members, subGid)
+                  nestedGroupNodes.push({
                     id: subGid,
                     type: 'blockGroup',
-                    position: member.relativePosition,
+                    position: m.relativePosition,
                     style: {},
                     data: {
-                      label: member.label,
+                      label: m.label,
                       collapsed: true,
-                      memberIds: sub.memberIds,
-                      expandedWidth: member.expandedWidth,
-                      expandedHeight: member.expandedHeight,
-                      moduleChain: member.moduleChain.map(id => tmpToNew.get(id) ?? id),
-                      internalEdges: member.internalEdges.map(e => ({
-                        from: tmpToNew.get(e.from) ?? e.from,
-                        fromHandle: e.fromHandle,
-                        to: tmpToNew.get(e.to) ?? e.to,
-                        toHandle: e.toHandle,
-                      })),
+                      memberIds: subMemberIds,
+                      expandedWidth: m.expandedWidth,
+                      expandedHeight: m.expandedHeight,
                     } as GroupNodeData,
                     parentId: parentGid,
                     extent: 'parent' as const,
-                    hidden: depth >= 1,
+                    hidden: true,  // root starts collapsed → all nested levels hidden initially
                   })
-                  // For nested groups, use their COLLAPSED footprint for the bounding box at the parent level
-                  // (parent starts collapsed → all children hidden, so this only matters when expanded later)
-                  maxRelX = Math.max(maxRelX, member.relativePosition.x + COLLAPSED_NODE_W)
-                  maxRelY = Math.max(maxRelY, member.relativePosition.y + COLLAPSED_HEIGHT)
+                  await api.patchGroup(subGid, { member_ids: subMemberIds }).catch(console.error)
+                  ids.push(subGid)
                 }
-              } catch (err) {
-                console.error('clone level failure', err)
               }
+              return ids
             }
-
-            if (memberIds.length > 0) {
-              await api.patchGroup(parentGid, { member_ids: memberIds }).catch(console.error)
-            }
-
-            // Remap chain + edges using THIS level's tmpId map
-            const remappedChain = levelModuleChain.map(id => tmpToNew.get(id) ?? id)
-            const remappedEdges = levelInternalEdges.map(e => ({
-              from: tmpToNew.get(e.from) ?? e.from,
-              fromHandle: e.fromHandle,
-              to: tmpToNew.get(e.to) ?? e.to,
-              toHandle: e.toHandle,
-            }))
-            // Patch the parent group node we already pushed (last group with id=parentGid),
-            // since at the time of push we used the un-remapped chain/edges.
-            const idx = allCreatedNodes.findIndex(n => n.id === parentGid)
-            if (idx >= 0) {
-              const gd = allCreatedNodes[idx].data as GroupNodeData
-              allCreatedNodes[idx] = {
-                ...allCreatedNodes[idx],
-                data: { ...gd, moduleChain: remappedChain, internalEdges: remappedEdges, memberIds },
-              }
-            }
-            return { memberIds, bounds: { w: maxRelX, h: maxRelY } }
+            rootDirectMemberIds = await cloneNestedLevel(template.nestedSnapshot.members, gid)
+            // Re-patch the root with its DIRECT memberIds (top-level visual children)
+            await api.patchGroup(gid, { member_ids: rootDirectMemberIds }).catch(console.error)
           }
 
-          // Create the root group
-          const res = await api.createGroup(label, [])
-          const gid = res.group.id
-          const PADDING = 24
-          const PADDING_TOP = 44
-
-          // Push the root group up front so cloneLevel can patch it after remapping
-          allCreatedNodes.push({
+          const groupNode: Node = {
             id: gid,
             type: 'blockGroup',
             position,
@@ -936,45 +1126,17 @@ export default function App() {
             data: {
               label,
               collapsed: true,
-              memberIds: [],
-              expandedWidth: 300,
-              expandedHeight: 200,
-              moduleChain: [],
-              internalEdges: [],
+              memberIds: rootDirectMemberIds ?? newMemberIds,
+              expandedWidth: gw,
+              expandedHeight: gh,
+              moduleChain: groupModuleChain,
+              ...(groupInternalEdges !== undefined ? { internalEdges: groupInternalEdges } : {}),
             } as GroupNodeData,
-          })
-
-          const rootResult = await cloneLevel(v2Root.members, v2Root.moduleChain, v2Root.internalEdges, gid, 0)
-
-          // Final size adjustment for the root from observed bounds
-          const rootIdx = allCreatedNodes.findIndex(n => n.id === gid)
-          if (rootIdx >= 0) {
-            const gd = allCreatedNodes[rootIdx].data as GroupNodeData
-            allCreatedNodes[rootIdx] = {
-              ...allCreatedNodes[rootIdx],
-              data: {
-                ...gd,
-                expandedWidth: rootResult.bounds.w + PADDING,
-                expandedHeight: rootResult.bounds.h + PADDING_TOP + PADDING,
-              },
-            }
           }
 
-          // Order: parents must appear before children for React Flow's parentId resolution
-          // We pushed parents before children naturally (root first, then descendants in BFS-ish order),
-          // so just append the whole batch.
-          setNodes(ns => [...ns, ...allCreatedNodes])
-        } else if (template) {
-          // Template exists but is empty — fall through to empty group
-          const res = await api.createGroup(label, [])
-          const data: GroupNodeData = {
-            label,
-            collapsed: true,
-            memberIds: [],
-            expandedWidth: 300,
-            expandedHeight: 200,
-          }
-          setNodes(ns => [...ns, { id: res.group.id, type: 'blockGroup', position, data }])
+          // Order matters: parent group nodes must appear BEFORE child nodes in React Flow's array
+          // for parentId resolution. Root first, then nested groups (each before its members), then modules.
+          setNodes(ns => [groupNode, ...nestedGroupNodes, ...ns, ...newMemberNodes])
         } else {
           // Empty group (no template or empty template) — starts collapsed, shows compact block with handles
           const res = await api.createGroup(label, [])
@@ -1044,18 +1206,86 @@ export default function App() {
       const allNewEdges: Edge[] = []
       const newMemberIds: string[] = []
       const newBoundaryEdges: SavedEdge[] = [...(gd.savedBoundaryEdges ?? [])]
-
-      // Helper: get position below group for final outputs
-      const getFinalOutputBase = () => {
-        const grpNode = rfRef.current?.getNode(groupTarget)
-        const expandedH = isCollapsed ? 0 : ((grpNode?.style?.height as number) ?? gd.expandedHeight ?? 200)
-        const expandedW = isCollapsed
-          ? ((grpNode?.measured as any)?.width ?? COLLAPSED_NODE_W)
-          : ((grpNode?.style?.width as number) ?? gd.expandedWidth ?? 300)
-        return {
-          centerX: (grpNode?.position.x ?? 400) + expandedW / 2,
-          y: (grpNode?.position.y ?? 0) + expandedH + 60,
+      // For modules nested inside child groups, intermediate auto-tensors must be parented
+      // to the IMMEDIATE parent (the child group), not the outer groupTarget — otherwise
+      // module-relative position math lands the tensor in the wrong coordinate space.
+      // Track per-parent member additions so each nested group's memberIds & backend record stay correct.
+      const newMembersByParent = new Map<string, string[]>()
+      const recordMember = (parentId: string, mid: string) => {
+        if (parentId === groupTarget) {
+          newMemberIds.push(mid)
+        } else {
+          let arr = newMembersByParent.get(parentId)
+          if (!arr) { arr = []; newMembersByParent.set(parentId, arr) }
+          arr.push(mid)
         }
+      }
+      // A node is hidden if ANY ancestor group (incl. itself if it's a group) is collapsed.
+      const isAnyAncestorCollapsed = (nodeId: string | undefined): boolean => {
+        let cur: string | undefined = nodeId
+        while (cur) {
+          const n = rfRef.current?.getNode(cur)
+          if (!n) return false
+          if (n.type === 'blockGroup' && (n.data as GroupNodeData).collapsed) return true
+          cur = n.parentId
+        }
+        return false
+      }
+      // First visible ancestor walking up the parentId chain (or self if visible).
+      const visibleAncestor = (nodeId: string): string => {
+        let cur: string | undefined = nodeId
+        while (cur) {
+          const n: Node | undefined = rfRef.current?.getNode(cur)
+          if (!n) return nodeId
+          if (!n.hidden) return cur
+          cur = n.parentId
+        }
+        return nodeId
+      }
+      // Per-collapsed-sub-group savedBoundaryEdges so expanding a sub-group later restores edges.
+      const newBoundaryByGroup = new Map<string, SavedEdge[]>()
+      const addBoundaryForGroup = (groupId: string, se: SavedEdge) => {
+        let arr = newBoundaryByGroup.get(groupId)
+        if (!arr) { arr = []; newBoundaryByGroup.set(groupId, arr) }
+        arr.push(se)
+      }
+
+      // Position below the source module's nearest visible ancestor (so each module's final
+      // outputs land below ITS visible representation — e.g. EXPERT outputs below EXPERT pill,
+      // GATE outputs below GATE pill — instead of all stacking at root group's bottom).
+      const getFinalOutputBase = (moduleId?: string) => {
+        // No moduleId or outer group is collapsed → fall back to root group placement (legacy)
+        if (!moduleId || isCollapsed) {
+          const grpNode = rfRef.current?.getNode(groupTarget)
+          const expandedH = isCollapsed ? 0 : ((grpNode?.style?.height as number) ?? gd.expandedHeight ?? 200)
+          const expandedW = isCollapsed
+            ? ((grpNode?.measured as any)?.width ?? COLLAPSED_NODE_W)
+            : ((grpNode?.style?.width as number) ?? gd.expandedWidth ?? 300)
+          return {
+            centerX: (grpNode?.position.x ?? 400) + expandedW / 2,
+            y: (grpNode?.position.y ?? 0) + expandedH + 60,
+          }
+        }
+        const refId = visibleAncestor(moduleId)
+        const refNode = rfRef.current?.getNode(refId)
+        if (!refNode) return { centerX: 400, y: 300 }
+        let w = 0, h = 0
+        if (refNode.type === 'blockGroup') {
+          const rgd = refNode.data as GroupNodeData
+          if (rgd.collapsed) {
+            w = (refNode.measured as any)?.width ?? COLLAPSED_NODE_W
+            h = (refNode.measured as any)?.height ?? COLLAPSED_HEIGHT
+          } else {
+            w = (refNode.style?.width as number) ?? rgd.expandedWidth ?? 300
+            h = (refNode.style?.height as number) ?? rgd.expandedHeight ?? 200
+          }
+        } else {
+          w = (refNode.measured as any)?.width ?? 180
+          h = (refNode.measured as any)?.height ?? 120
+        }
+        const allCurrentNodes = rfRef.current?.getNodes() ?? []
+        const abs = getAbsolutePosition(refId, allCurrentNodes)
+        return { centerX: abs.x + w / 2, y: abs.y + h + 60 }
       }
 
       try {
@@ -1075,46 +1305,6 @@ export default function App() {
 
           while (queue.length > 0) {
             const item = queue.shift()!
-
-            // ── If this item targets a sub-group, expand it inline ─────────────
-            // The sub-group's own moduleChain entries are queued with the same input tensor;
-            // its internalEdges merge into downstream; its exit modules carry the parent's downstream forward.
-            const itemNode = rfRef.current?.getNode(item.moduleId)
-            if (itemNode?.type === 'blockGroup') {
-              const subGd = itemNode.data as GroupNodeData
-              const subChain = subGd.moduleChain ?? []
-              const subEdges = subGd.internalEdges ?? []
-              // Merge sub-group's edges into downstream (same map; sub-group ids are namespace-distinct)
-              for (const e of subEdges) {
-                if (!downstream.has(e.from)) downstream.set(e.from, [])
-                downstream.get(e.from)!.push({ to: e.to, fromHandle: e.fromHandle, toHandle: e.toHandle })
-              }
-              // Sub-group exit nodes inherit the PARENT's downstream that was attached to the sub-group id
-              const parentDown = downstream.get(item.moduleId) ?? []
-              if (parentDown.length > 0) {
-                const subFromSet = new Set(subEdges.map(e => e.from))
-                const subAllIds = new Set([...subChain, ...subEdges.map(e => e.from), ...subEdges.map(e => e.to)])
-                const exitIds = subEdges.length === 0 ? subChain : [...subAllIds].filter(id => !subFromSet.has(id))
-                for (const exitId of exitIds) {
-                  if (!downstream.has(exitId)) downstream.set(exitId, [])
-                  downstream.get(exitId)!.push(...parentDown)
-                }
-              }
-              // Queue each entry of the sub-group with the same input tensor.
-              // For sub-group entries we are still on the EXTERNAL boundary if this item came from outside,
-              // so propagate the externalIdx; otherwise it's an internal feed (-1).
-              for (let i = 0; i < subChain.length; i++) {
-                const subEntry = subChain[i]
-                queue.push({
-                  tensorId: item.tensorId,
-                  moduleId: subEntry,
-                  targetHandle: i === 0 ? item.targetHandle : null,
-                  externalIdx: item.externalIdx >= 0 && i === 0 ? item.externalIdx : -1,
-                })
-              }
-              continue
-            }
-
             const apiHandle = (item.targetHandle && item.targetHandle !== 'input') ? item.targetHandle : null
             const cr = await api.createConnection(item.tensorId, item.moduleId, apiHandle)
 
@@ -1126,11 +1316,43 @@ export default function App() {
                 }
                 newBoundaryEdges.push({ id: cr.connection.id, source, sourceHandle: sourceHandle ?? null, target: item.moduleId, targetHandle: 'input' })
               } else {
-                allNewEdges.push({ id: cr.connection.id, source, target: item.moduleId, sourceHandle: sourceHandle ?? undefined, targetHandle: 'input', style: EDGE_STYLE, markerEnd: EDGE_MARKER })
+                // Outer expanded — but item.moduleId might be hidden inside a collapsed nested group.
+                // Redirect target to the visible pill and save a boundary for the sub-group.
+                const visTarget = visibleAncestor(item.moduleId)
+                allNewEdges.push({
+                  id: cr.connection.id, source, target: visTarget,
+                  sourceHandle: sourceHandle ?? undefined, targetHandle: 'input',
+                  style: EDGE_STYLE, markerEnd: EDGE_MARKER,
+                })
+                if (visTarget !== item.moduleId) {
+                  addBoundaryForGroup(visTarget, {
+                    id: cr.connection.id, source, sourceHandle: sourceHandle ?? null,
+                    target: item.moduleId, targetHandle: 'input',
+                  })
+                }
               }
             } else {
-              // Internal tensor → module edge
-              allNewEdges.push({ id: cr.connection.id, source: item.tensorId, target: item.moduleId, targetHandle: item.targetHandle ?? undefined, style: EDGE_STYLE, markerEnd: EDGE_MARKER, hidden: isCollapsed })
+              // Internal tensor → module edge.
+              // Redirect to a collapsed INNER sub-group's pill if target is hidden there. Don't
+              // redirect to groupTarget itself — the existing collapsed-root flow (root's
+              // memberSet unhides direct-member edges on expand) handles that case correctly.
+              const visTarget = visibleAncestor(item.moduleId)
+              const targetRedirected = visTarget !== item.moduleId && visTarget !== groupTarget
+              allNewEdges.push({
+                id: cr.connection.id,
+                source: item.tensorId,
+                target: targetRedirected ? visTarget : item.moduleId,
+                targetHandle: targetRedirected ? 'input' : (item.targetHandle ?? undefined),
+                style: EDGE_STYLE, markerEnd: EDGE_MARKER,
+                hidden: isCollapsed,
+              })
+              if (targetRedirected) {
+                addBoundaryForGroup(visTarget, {
+                  id: cr.connection.id,
+                  source: item.tensorId, sourceHandle: null,
+                  target: item.moduleId, targetHandle: item.targetHandle ?? null,
+                })
+              }
             }
 
             const isLast = !downstream.has(item.moduleId)
@@ -1142,28 +1364,39 @@ export default function App() {
                 const modNode = rfRef.current?.getNode(item.moduleId)
                 const modW = (modNode?.measured as any)?.width ?? 180
                 const cX = modNode ? modNode.position.x + modW / 2 : 30
-                newMemberIds.push(ot.id)
+                const modParentId = modNode?.parentId ?? groupTarget
+                const tensorHidden = isAnyAncestorCollapsed(modParentId)
+                recordMember(modParentId, ot.id)
                 allNewNodes.push({
                   id: ot.id, type: 'tensor',
                   position: modNode ? { x: cX - TENSOR_EST_W / 2, y: modNode.position.y + 160 } : { x: 30, y: 120 },
                   data: { name: '', rank: rankFromDims(ot.shape.dims), dims: ot.shape.dims, dtype: ot.dtype } as TensorNodeData,
-                  parentId: groupTarget, hidden: isCollapsed,
+                  parentId: modParentId, hidden: tensorHidden,
                 })
                 pendingCenter.current.set(ot.id, cX)
-                allNewEdges.push({ id: `auto-${cr.connection.id}`, source: item.moduleId, target: ot.id, style: EDGE_STYLE, markerEnd: EDGE_MARKER, hidden: isCollapsed })
+                allNewEdges.push({ id: `auto-${cr.connection.id}`, source: item.moduleId, target: ot.id, style: EDGE_STYLE, markerEnd: EDGE_MARKER, hidden: tensorHidden })
                 for (const d of (downstream.get(item.moduleId) ?? [])) {
                   const th = d.toHandle === 'input' ? null : d.toHandle
                   queue.push({ tensorId: ot.id, moduleId: d.to, targetHandle: th, externalIdx: -1 })
                 }
               } else {
-                const { centerX, y: finalY } = getFinalOutputBase()
+                const { centerX, y: finalY } = getFinalOutputBase(item.moduleId)
                 pendingCenter.current.set(ot.id, centerX)
                 allNewNodes.push({ id: ot.id, type: 'tensor', position: { x: centerX - TENSOR_EST_W / 2, y: finalY }, data: { name: '', rank: rankFromDims(ot.shape.dims), dims: ot.shape.dims, dtype: ot.dtype } as TensorNodeData })
                 if (isCollapsed) {
                   newBoundaryEdges.push({ id: `auto-${cr.connection.id}`, source: item.moduleId, sourceHandle: 'output', target: ot.id, targetHandle: 'input' })
                   allNewEdges.push({ id: `auto-${cr.connection.id}`, source: groupTarget, sourceHandle: 'output', target: ot.id, targetHandle: 'input', style: EDGE_STYLE, markerEnd: EDGE_MARKER })
                 } else {
-                  allNewEdges.push({ id: `auto-${cr.connection.id}`, source: item.moduleId, sourceHandle: 'output', target: ot.id, targetHandle: 'input', style: EDGE_STYLE, markerEnd: EDGE_MARKER })
+                  // Source module might be hidden inside a collapsed sub-group → redirect.
+                  const visSource = visibleAncestor(item.moduleId)
+                  allNewEdges.push({ id: `auto-${cr.connection.id}`, source: visSource, sourceHandle: 'output', target: ot.id, targetHandle: 'input', style: EDGE_STYLE, markerEnd: EDGE_MARKER })
+                  if (visSource !== item.moduleId) {
+                    addBoundaryForGroup(visSource, {
+                      id: `auto-${cr.connection.id}`,
+                      source: item.moduleId, sourceHandle: 'output',
+                      target: ot.id, targetHandle: 'input',
+                    })
+                  }
                 }
               }
             } else if (cr.output_tensors && cr.output_tensors.length >= 2) {
@@ -1187,20 +1420,22 @@ export default function App() {
                   const modY = modNode?.position.y ?? 50
                   const offsetX = i === 0 ? -TENSOR_EST_W / 2 - TENSOR_TWO_GAP / 2 : TENSOR_EST_W / 2 + TENSOR_TWO_GAP / 2
                   const cX = modX + modW / 2 + offsetX
-                  newMemberIds.push(ot.id)
+                  const modParentId = modNode?.parentId ?? groupTarget
+                  const tensorHidden = isAnyAncestorCollapsed(modParentId)
+                  recordMember(modParentId, ot.id)
                   allNewNodes.push({
                     id: ot.id, type: 'tensor',
                     position: { x: cX - TENSOR_EST_W / 2, y: modY + 160 },
                     data: { name: srcHandle, rank: rankFromDims(ot.shape.dims), dims: ot.shape.dims, dtype: ot.dtype } as TensorNodeData,
-                    parentId: groupTarget, hidden: isCollapsed,
+                    parentId: modParentId, hidden: tensorHidden,
                   })
                   pendingCenter.current.set(ot.id, cX)
-                  allNewEdges.push({ id: autoEdgeId, source: item.moduleId, sourceHandle: srcHandle, target: ot.id, style: EDGE_STYLE, markerEnd: EDGE_MARKER, hidden: isCollapsed })
+                  allNewEdges.push({ id: autoEdgeId, source: item.moduleId, sourceHandle: srcHandle, target: ot.id, style: EDGE_STYLE, markerEnd: EDGE_MARKER, hidden: tensorHidden })
                   for (const d of pendingForHandle) {
                     queue.push({ tensorId: ot.id, moduleId: d.to, targetHandle: d.toHandle === 'input' ? null : d.toHandle, externalIdx: -1 })
                   }
                 } else {
-                  const { centerX: fCX, y: finalY } = getFinalOutputBase()
+                  const { centerX: fCX, y: finalY } = getFinalOutputBase(item.moduleId)
                   const offsetX = i === 0 ? -TENSOR_EST_W / 2 - TENSOR_TWO_GAP / 2 : TENSOR_EST_W / 2 + TENSOR_TWO_GAP / 2
                   const otCX = fCX + offsetX
                   allNewNodes.push({
@@ -1213,7 +1448,23 @@ export default function App() {
                     newBoundaryEdges.push({ id: autoEdgeId, source: item.moduleId, sourceHandle: srcHandle, target: ot.id })
                     allNewEdges.push({ id: autoEdgeId, source: groupTarget, sourceHandle: 'output', target: ot.id, style: EDGE_STYLE, markerEnd: EDGE_MARKER })
                   } else {
-                    allNewEdges.push({ id: autoEdgeId, source: item.moduleId, sourceHandle: srcHandle, target: ot.id, style: EDGE_STYLE, markerEnd: EDGE_MARKER })
+                    // Source module may be hidden inside a collapsed sub-group → redirect.
+                    const visSource = visibleAncestor(item.moduleId)
+                    const sourceRedirected = visSource !== item.moduleId
+                    allNewEdges.push({
+                      id: autoEdgeId,
+                      source: visSource,
+                      sourceHandle: sourceRedirected ? 'output' : srcHandle,
+                      target: ot.id,
+                      style: EDGE_STYLE, markerEnd: EDGE_MARKER,
+                    })
+                    if (sourceRedirected) {
+                      addBoundaryForGroup(visSource, {
+                        id: autoEdgeId,
+                        source: item.moduleId, sourceHandle: srcHandle,
+                        target: ot.id, targetHandle: null,
+                      })
+                    }
                   }
                 }
               }
@@ -1312,8 +1563,33 @@ export default function App() {
 
         const updatedMemberIds = [...gd.memberIds, ...newMemberIds]
         if (newMemberIds.length > 0) api.patchGroup(groupTarget, { member_ids: updatedMemberIds }).catch(console.error)
+        // Patch each nested parent group (whose modules produced intermediate tensors during this connect)
+        for (const [parentId, additions] of newMembersByParent) {
+          const parentNode = rfRef.current?.getNode(parentId)
+          const existing = ((parentNode?.data as GroupNodeData)?.memberIds ?? [])
+          const merged = [...existing, ...additions]
+          api.patchGroup(parentId, { member_ids: merged }).catch(console.error)
+        }
         setNodes(ns => [
-          ...ns.map(n => n.id === groupTarget ? { ...n, data: { ...n.data, memberIds: updatedMemberIds, savedBoundaryEdges: newBoundaryEdges } } : n),
+          ...ns.map(n => {
+            if (n.id === groupTarget) {
+              return { ...n, data: { ...n.data, memberIds: updatedMemberIds, savedBoundaryEdges: newBoundaryEdges } }
+            }
+            const memberAdds = newMembersByParent.get(n.id)
+            const boundaryAdds = newBoundaryByGroup.get(n.id)
+            if (memberAdds || boundaryAdds) {
+              const ngd = n.data as GroupNodeData
+              return {
+                ...n,
+                data: {
+                  ...ngd,
+                  ...(memberAdds ? { memberIds: [...(ngd.memberIds ?? []), ...memberAdds] } : {}),
+                  ...(boundaryAdds ? { savedBoundaryEdges: [...(ngd.savedBoundaryEdges ?? []), ...boundaryAdds] } : {}),
+                },
+              }
+            }
+            return n
+          }),
           ...allNewNodes,
         ])
         setEdges(es => [...es, ...allNewEdges])
@@ -1447,81 +1723,144 @@ export default function App() {
       const gid = res.group.id
       const selectedSet = new Set(selectedIds)
 
-      const directModuleNodes = selected.filter((n: Node) => ALL_MODULE_TYPES.has(n.type!))
+      // Direct modules (not inside a selected group)
+      const directModuleNodes = selected
+        .filter((n: Node) => ALL_MODULE_TYPES.has(n.type!))
+      // Groups in selection
       const selectedGroupNodes = selected.filter((n: Node) => n.type === 'blockGroup')
-      const directMemberNodes = [...directModuleNodes, ...selectedGroupNodes]
-      const directMemberIdSet = new Set(directMemberNodes.map((n: Node) => n.id))
-      const selectedTensorIdSet = new Set(
-        selected.filter((n: Node) => n.type === 'tensor').map((n: Node) => n.id)
+      const selectedGroupIdSet = new Set(selectedGroupNodes.map((n: Node) => n.id))
+
+      // Collect ALL modules from selected groups (every member at every depth — not just entries).
+      // Without this, non-entry inner modules (e.g., the SiLU after the first Linear in EXPERT) are
+      // missing from the snapshot, so on clone the BFS can't reach them and outputs never get wired.
+      const groupFlatModuleIds = selectedGroupNodes.flatMap((g: Node) =>
+        getAllModuleIdsRecursive(g.id, allNodes)
       )
+      const groupFlatModules = groupFlatModuleIds
+        .map((id: string) => allNodes.find((n: Node) => n.id === id))
+        .filter(Boolean) as Node[]
 
-      // Build internalEdges at THIS LEVEL only — references direct member ids (modules or sub-groups).
-      const allCanvasEdges = rfRef.current?.getEdges() ?? []
-      const internalEdges: EdgeSnapshot[] = []
-      for (const fromNode of directMemberNodes) {
-        const autoEdgesOut = allCanvasEdges.filter((e: Edge) =>
-          e.source === fromNode.id && e.id.startsWith('auto-') && selectedTensorIdSet.has(e.target)
-        )
-        for (const autoEdge of autoEdgesOut) {
-          const edgesFromTensor = allCanvasEdges.filter((e: Edge) =>
-            e.source === autoEdge.target && !e.id.startsWith('auto-') && directMemberIdSet.has(e.target)
-          )
-          for (const outEdge of edgesFromTensor) {
-            internalEdges.push({
-              from: fromNode.id,
-              fromHandle: autoEdge.sourceHandle ?? 'output',
-              to: outEdge.target,
-              toHandle: outEdge.targetHandle ?? 'input',
-            })
-          }
-        }
-      }
-
-      // Entry members = direct members not targeted by any direct internal edge
-      const targetedByInternal = new Set(internalEdges.map(e => e.to))
-      const instanceModuleChain = directMemberNodes
-        .slice()
+      // All modules (direct + flattened), sorted by absolute Y position
+      const allModuleNodes = [...directModuleNodes, ...groupFlatModules]
+        .filter((n, i, arr) => arr.findIndex(m => m.id === n.id) === i) // deduplicate
         .sort((a: Node, b: Node) => {
           const aAbs = getAbsolutePosition(a.id, allNodes)
           const bAbs = getAbsolutePosition(b.id, allNodes)
           return aAbs.y - bAbs.y
         })
-        .filter((n: Node) => !targetedByInternal.has(n.id))
-        .map((n: Node) => n.id)
 
-      // Recursive snapshot for the registry — captures structure for arbitrary nesting depth.
-      const buildMemberSnapshot = (n: Node, parentX: number, parentY: number): MemberSnapshot => {
+      const moduleChainSnapshot: ModuleSnapshot[] = allModuleNodes.map((n: Node) => {
         const absPos = getAbsolutePosition(n.id, allNodes)
-        const relPos = { x: absPos.x - parentX, y: absPos.y - parentY }
-        if (n.type === 'blockGroup') {
-          const childGd = n.data as GroupNodeData
-          const childMembers: MemberSnapshot[] = (childGd.memberIds ?? [])
-            .map((mid: string) => allNodes.find((x: Node) => x.id === mid))
-            .filter((x): x is Node => Boolean(x))
-            .filter((x: Node) => x.type === 'blockGroup' || ALL_MODULE_TYPES.has(x.type!))
-            .map((x: Node) => buildMemberSnapshot(x, absPos.x, absPos.y))
-          return {
-            kind: 'group',
-            tmpId: n.id,
-            label: childGd.label ?? 'Group',
-            relativePosition: relPos,
-            expandedWidth: childGd.expandedWidth ?? (n.style?.width as number) ?? 300,
-            expandedHeight: childGd.expandedHeight ?? (n.style?.height as number) ?? 200,
-            members: childMembers,
-            moduleChain: childGd.moduleChain ?? [],
-            internalEdges: childGd.internalEdges ?? [],
-          }
-        }
         return {
-          kind: 'module',
           tmpId: n.id,
           type: n.type!,
           data: { ...n.data } as Record<string, unknown>,
-          relativePosition: relPos,
+          relativePosition: { x: absPos.x - gx, y: absPos.y - gy },
+        }
+      })
+
+      const allCanvasEdges = rfRef.current?.getEdges() ?? []
+      const selectedModuleIdSet = new Set(directModuleNodes.map((n: Node) => n.id))
+      const selectedTensorIdSet = new Set(
+        selected.filter((n: Node) => n.type === 'tensor').map((n: Node) => n.id)
+      )
+      const targetNodeSet = new Set([...selectedModuleIdSet, ...selectedGroupIdSet])
+
+      const internalEdges: EdgeSnapshot[] = []
+
+      // 1. Direct module → module/group edges
+      for (const modA of directModuleNodes) {
+        const autoEdgesOut = allCanvasEdges.filter((e: Edge) =>
+          e.source === modA.id && e.id.startsWith('auto-') && selectedTensorIdSet.has(e.target)
+        )
+        for (const autoEdge of autoEdgesOut) {
+          const edgesFromTensor = allCanvasEdges.filter((e: Edge) =>
+            e.source === autoEdge.target && !e.id.startsWith('auto-') && targetNodeSet.has(e.target)
+          )
+          for (const outEdge of edgesFromTensor) {
+            const toNode = allNodes.find((n: Node) => n.id === outEdge.target)
+            const toIds = toNode?.type === 'blockGroup'
+              ? getFlatModuleIds((toNode.data as GroupNodeData).moduleChain ?? [], allNodes)
+              : [outEdge.target]
+            for (const toId of toIds) {
+              internalEdges.push({ from: modA.id, fromHandle: autoEdge.sourceHandle ?? 'output', to: toId, toHandle: outEdge.targetHandle ?? 'input' })
+            }
+          }
         }
       }
 
-      const rootMembers: MemberSnapshot[] = directMemberNodes.map(n => buildMemberSnapshot(n, gx, gy))
+      // 2. Each selected group's own internal edges (already flat module IDs)
+      for (const g of selectedGroupNodes) {
+        const gd = g.data as GroupNodeData
+        if (gd.internalEdges) internalEdges.push(...gd.internalEdges)
+      }
+
+      // 3. Cross-group edges: selected group → (auto) → selected tensor → module/group
+      for (const g of selectedGroupNodes) {
+        const gd = g.data as GroupNodeData
+        const exitMods = getGroupExitModules(gd)
+        const autoEdgesFromGroup = allCanvasEdges.filter((e: Edge) =>
+          e.source === g.id && e.id.startsWith('auto-') && selectedTensorIdSet.has(e.target)
+        )
+        for (const autoEdge of autoEdgesFromGroup) {
+          const edgesFromTensor = allCanvasEdges.filter((e: Edge) =>
+            e.source === autoEdge.target && !e.id.startsWith('auto-') && targetNodeSet.has(e.target)
+          )
+          for (const outEdge of edgesFromTensor) {
+            const toNode = allNodes.find((n: Node) => n.id === outEdge.target)
+            const toIds = toNode?.type === 'blockGroup'
+              ? getFlatModuleIds((toNode.data as GroupNodeData).moduleChain ?? [], allNodes)
+              : [outEdge.target]
+            for (const exitMod of exitMods) {
+              for (const toId of toIds) {
+                internalEdges.push({ from: exitMod, fromHandle: 'output', to: toId, toHandle: outEdge.targetHandle ?? 'input' })
+              }
+            }
+          }
+        }
+      }
+
+      // Entry modules = not targeted by any internal edge
+      const targetedByInternal = new Set(internalEdges.map(e => e.to))
+      const instanceModuleChain = allModuleNodes
+        .filter((n: Node) => !targetedByInternal.has(n.id))
+        .map((n: Node) => n.id)
+
+      // Build a visual-hierarchy snapshot ONLY when at least one nested group was selected.
+      // This lives alongside the flat moduleChain/internalEdges (which still drive wiring).
+      const buildNestedMembers = (parent: Node | null, parentX: number, parentY: number): NestedMember[] => {
+        const childNodes: Node[] = parent === null
+          ? selected.filter((n: Node) => ALL_MODULE_TYPES.has(n.type!) || n.type === 'blockGroup')
+          : ((parent.data as GroupNodeData).memberIds ?? [])
+              .map((mid: string) => allNodes.find((x: Node) => x.id === mid))
+              .filter((x): x is Node => Boolean(x))
+              .filter((x: Node) => ALL_MODULE_TYPES.has(x.type!) || x.type === 'blockGroup')
+
+        return childNodes.map((cn: Node): NestedMember => {
+          const abs = getAbsolutePosition(cn.id, allNodes)
+          const relPos = { x: abs.x - parentX, y: abs.y - parentY }
+          if (cn.type === 'blockGroup') {
+            const cgd = cn.data as GroupNodeData
+            return {
+              kind: 'group',
+              tmpId: cn.id,
+              label: cgd.label ?? 'Group',
+              relativePosition: relPos,
+              expandedWidth: cgd.expandedWidth ?? (cn.style?.width as number) ?? 300,
+              expandedHeight: cgd.expandedHeight ?? (cn.style?.height as number) ?? 200,
+              members: buildNestedMembers(cn, abs.x, abs.y),
+            }
+          }
+          return { kind: 'module', tmpId: cn.id, relativePosition: relPos }
+        })
+      }
+      const nestedSnapshot: NestedGroupSnapshot | undefined = selectedGroupNodes.length > 0
+        ? {
+            members: buildNestedMembers(null, gx, gy),
+            expandedWidth: gw,
+            expandedHeight: gh,
+          }
+        : undefined
 
       const groupNode: Node = {
         id: gid,
@@ -1561,9 +1900,9 @@ export default function App() {
           : [...prev, {
               id: gid,
               label: 'Group',
-              rootMembers,
-              rootModuleChain: instanceModuleChain,
-              rootInternalEdges: internalEdges,
+              moduleChain: moduleChainSnapshot,
+              internalEdges,
+              ...(nestedSnapshot ? { nestedSnapshot } : {}),
             }]
       )
     } catch (err) {

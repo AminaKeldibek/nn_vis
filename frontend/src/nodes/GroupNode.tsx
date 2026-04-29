@@ -18,6 +18,12 @@ export type EdgeSnapshot = {
   toHandle: string    // 'input', 'self', 'source', 'index'
 }
 
+// Snapshot captured by reflow on EXPAND so collapse can perfectly undo (restore siblings + ancestor sizes).
+export type ReflowSnapshot = {
+  shifts: { id: string; dx: number; dy: number }[]
+  resizes: { id: string; prevW: number; prevH: number }[]
+}
+
 export type GroupNodeData = {
   label: string
   collapsed: boolean
@@ -29,6 +35,7 @@ export type GroupNodeData = {
   moduleChain?: string[]    // entry module IDs — used when connecting tensors to the group
   internalEdges?: EdgeSnapshot[]  // module→module topology; undefined = legacy sequential
   expandedX?: number        // saved left-edge x when collapsing, restored on expand
+  reflowSnapshot?: ReflowSnapshot  // changes this group's last expand made to siblings/ancestors
 }
 
 const HANDLE_STYLE = {
